@@ -1,9 +1,8 @@
 import pandas as pd
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import rdMolDescriptors
-from rdkit.Chem import AllChem
-from sklearn.model_selection import train_test_split, StratifiedKFold
+from rdkit.Chem import AllChem, DataStructs
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, roc_auc_score
 from imblearn.over_sampling import SMOTE
 from sklearn.preprocessing import StandardScaler
@@ -39,17 +38,11 @@ def get_fingerprint(smiles, radius=2, n_bits=2048):
         # Generate Morgan Fingerprint as Bit Vector
         fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=n_bits)
         # Convert ExplicitBitVect to a NumPy array
-        arr = np.zeros((1,), dtype=np.int8)
+        arr = np.zeros((n_bits,), dtype=np.int8)
         DataStructs.ConvertToNumpyArray(fp, arr)
         return arr
     else:
         return None
-
-# Alternative: Using a generator if you prefer incremental fingerprint generation
-# However, using GetMorganFingerprintAsBitVect is more straightforward for this use case
-
-# Import DataStructs for conversion
-from rdkit import DataStructs
 
 # Convert SMILES to fingerprints
 print("Generating fingerprints...")
@@ -57,7 +50,7 @@ train_df['fingerprint'] = train_df['smiles'].apply(get_fingerprint)
 initial_count = len(train_df)
 train_df = train_df.dropna(subset=['fingerprint'])
 final_count = len(train_df)
-print(f'Dropped {initial_count - final_count} samples due to invalid SMILES.')
+print(f'Dropped {initial_count - final_count} training samples due to invalid SMILES.')
 
 # Convert fingerprints to numpy arrays
 X = np.array([fp for fp in train_df['fingerprint']])
@@ -149,14 +142,10 @@ print(model)
 # 5. Training Setup
 # ==============================
 
-# Define loss function with class weights (optional if class imbalance handled by SMOTE)
-# If you haven't applied SMOTE, compute class weights as follows:
-# from sklearn.utils import class_weight
-# class_weights = class_weight.compute_class_weight('balanced', classes=np.unique(y), y=y)
-# class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
-# criterion = nn.CrossEntropyLoss(weight=class_weights)
-
+# Define loss function
 criterion = nn.CrossEntropyLoss()
+
+# Define optimizer and scheduler
 optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5, verbose=True)
 
@@ -252,12 +241,12 @@ for epoch in range(num_epochs):
 # Load test data
 test_df = pd.read_csv('test.csv')
 
-# Function to compute fingerprints for test data
+# Function to compute Morgan fingerprints for test data
 def get_fingerprint_test(smiles, radius=2, n_bits=2048):
     mol = Chem.MolFromSmiles(smiles)
     if mol:
         fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=n_bits)
-        arr = np.zeros((1,), dtype=np.int8)
+        arr = np.zeros((n_bits,), dtype=np.int8)
         DataStructs.ConvertToNumpyArray(fp, arr)
         return arr
     else:
