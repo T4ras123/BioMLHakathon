@@ -85,7 +85,7 @@ def get_batches(dataset, batch_size):
         tokens, labels = batch
         yield tokens.to(device), labels.to(device)
 
-def train_model(model, train_dataset, val_dataset, epochs=10, batch_size=32, lr=1e-3):
+def train_model(model, train_dataset, val_dataset, epochs=10, batch_size=32, lr=1e-4):
     optimizer = optim.AdamW(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
