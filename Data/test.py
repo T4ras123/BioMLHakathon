@@ -1,50 +1,77 @@
 import pandas as pd
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import AllChem
+from rdkit.Chem import rdMolDescriptors
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import accuracy_score, roc_auc_score
 from imblearn.over_sampling import SMOTE
+from sklearn.preprocessing import StandardScaler
 import torch
 from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
+import warnings
+
+# Suppress warnings for cleaner output
+warnings.filterwarnings("ignore")
 
 # ==============================
-# 1. Data Preprocessing
+# 1. Device Configuration
+# ==============================
+
+# Set device to GPU if available, else CPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f'Using device: {device}')
+
+# ==============================
+# 2. Data Preprocessing
 # ==============================
 
 # Load training data
 train_df = pd.read_csv('train.csv')
 
-# Function to compute Morgan fingerprints
+# Function to compute Morgan fingerprints using MorganGenerator
 def get_fingerprint(smiles, radius=2, n_bits=2048):
     mol = Chem.MolFromSmiles(smiles)
     if mol:
-        return AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+        # Initialize MorganGenerator
+        mg = rdMolDescriptors.MorganGenerator(radius=radius, nBits=n_bits)
+        fp = mg.GetFingerprint(mol)
+        return np.array(fp)
     else:
         return None
 
 # Convert SMILES to fingerprints
+print("Generating fingerprints...")
 train_df['fingerprint'] = train_df['smiles'].apply(get_fingerprint)
 train_df = train_df.dropna(subset=['fingerprint'])
+print(f'Training samples after fingerprinting: {len(train_df)}')
 
 # Convert fingerprints to numpy arrays
 X = np.array([list(fp) for fp in train_df['fingerprint']])
 y = train_df['activity'].values
 
 # Handle class imbalance using SMOTE
+print("Applying SMOTE to handle class imbalance...")
 smote = SMOTE(random_state=42)
 X_res, y_res = smote.fit_resample(X, y)
+print(f'Resampled training samples: {len(X_res)}')
 
-# Split data
+# Feature Scaling
+print("Scaling features...")
+scaler = StandardScaler()
+X_res = scaler.fit_transform(X_res)
+
+# Split data into training and validation sets
+print("Splitting data into training and validation sets...")
 X_train, X_val, y_train, y_val = train_test_split(
     X_res, y_res, test_size=0.2, random_state=42, stratify=y_res
 )
+print(f'Training samples: {len(X_train)}, Validation samples: {len(X_val)}')
 
 # ==============================
-# 2. Dataset and DataLoader
+# 3. Dataset and DataLoader
 # ==============================
 
 class FingerprintDataset(Dataset):
@@ -58,55 +85,79 @@ class FingerprintDataset(Dataset):
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
+# Create Dataset instances
 train_dataset = FingerprintDataset(X_train, y_train)
 val_dataset = FingerprintDataset(X_val, y_val)
 
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=64)
+# Create DataLoader instances
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=2)
+val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=2)
 
 # ==============================
-# 3. Model Definition (GNN)
+# 4. Model Definition
 # ==============================
 
-class SimpleNN(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.3):
-        super(SimpleNN, self).__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
+class EnhancedNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim1, hidden_dim2, output_dim, dropout=0.5):
+        super(EnhancedNN, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim1)
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+        
+        self.fc2 = nn.Linear(hidden_dim1, hidden_dim2)
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+        
+        self.fc3 = nn.Linear(hidden_dim2, output_dim)
     
     def forward(self, x):
         out = self.fc1(x)
-        out = self.relu(out)
-        out = self.dropout(out)
+        out = self.relu1(out)
+        out = self.dropout1(out)
+        
         out = self.fc2(out)
+        out = self.relu2(out)
+        out = self.dropout2(out)
+        
+        out = self.fc3(out)
         return out
 
-input_dim = X_train.shape[1]
-hidden_dim = 512
-output_dim = 2
+# Define model parameters
+input_dim = X_train.shape[1]      # Number of fingerprint bits
+hidden_dim1 = 512
+hidden_dim2 = 256
+output_dim = 2                    # Number of classes
+dropout = 0.5
 
-model = SimpleNN(input_dim, hidden_dim, output_dim)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Initialize the model
+model = EnhancedNN(input_dim, hidden_dim1, hidden_dim2, output_dim, dropout)
 model = model.to(device)
+print(model)
 
 # ==============================
-# 4. Training Setup
+# 5. Training Setup
 # ==============================
+
+# Define loss function with class weights (optional if class imbalance handled by SMOTE)
+# If you haven't applied SMOTE, compute class weights as follows:
+# from sklearn.utils import class_weight
+# class_weights = class_weight.compute_class_weight('balanced', classes=np.unique(y), y=y)
+# class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
+# criterion = nn.CrossEntropyLoss(weight=class_weights)
 
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5, verbose=True)
 
 # ==============================
-# 5. Training and Evaluation Functions
+# 6. Training and Evaluation Functions
 # ==============================
 
 def train_epoch(model, loader, criterion, optimizer, device):
     model.train()
     running_loss = 0.0
     correct = 0
+    total = 0
     for X_batch, y_batch in tqdm(loader, desc="Training"):
         X_batch = X_batch.to(device)
         y_batch = y_batch.to(device)
@@ -120,15 +171,17 @@ def train_epoch(model, loader, criterion, optimizer, device):
         running_loss += loss.item() * X_batch.size(0)
         _, preds = torch.max(outputs, 1)
         correct += torch.sum(preds == y_batch)
+        total += y_batch.size(0)
     
-    epoch_loss = running_loss / len(loader.dataset)
-    epoch_acc = correct.double() / len(loader.dataset)
+    epoch_loss = running_loss / total
+    epoch_acc = correct.double() / total
     return epoch_loss, epoch_acc.item()
 
 def eval_model(model, loader, criterion, device):
     model.eval()
     running_loss = 0.0
     correct = 0
+    total = 0
     with torch.no_grad():
         for X_batch, y_batch in tqdm(loader, desc="Evaluating"):
             X_batch = X_batch.to(device)
@@ -140,53 +193,65 @@ def eval_model(model, loader, criterion, device):
             running_loss += loss.item() * X_batch.size(0)
             _, preds = torch.max(outputs, 1)
             correct += torch.sum(preds == y_batch)
+            total += y_batch.size(0)
     
-    epoch_loss = running_loss / len(loader.dataset)
-    epoch_acc = correct.double() / len(loader.dataset)
+    epoch_loss = running_loss / total
+    epoch_acc = correct.double() / total
     return epoch_loss, epoch_acc.item()
 
 # ==============================
-# 6. Training Loop with Early Stopping
+# 7. Training Loop with Early Stopping
 # ==============================
 
 best_val_acc = 0.0
-patience = 5
+patience = 10
 counter = 0
 num_epochs = 50
 
 for epoch in range(num_epochs):
-    print(f'Epoch {epoch+1}/{num_epochs}')
+    print(f'\nEpoch {epoch+1}/{num_epochs}')
+    print('-' * 30)
+    
     train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
     val_loss, val_acc = eval_model(model, val_loader, criterion, device)
     
     print(f'Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}')
     print(f'Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}')
     
-    scheduler.step()
+    # Step the scheduler based on validation accuracy
+    scheduler.step(val_acc)
     
+    # Check for improvement
     if val_acc > best_val_acc:
         best_val_acc = val_acc
         torch.save(model.state_dict(), 'best_model.pth')
+        print(f'Best model saved with Val Acc: {best_val_acc:.4f}')
         counter = 0
     else:
         counter += 1
+        print(f'No improvement for {counter} epochs')
         if counter >= patience:
-            print("Early stopping")
+            print("Early stopping triggered")
             break
 
 # ==============================
-# 7. Inference on Test Data
+# 8. Inference on Test Data
 # ==============================
 
 # Load test data
 test_df = pd.read_csv('test.csv')
 
 # Convert SMILES to fingerprints
+print("\nGenerating fingerprints for test data...")
 test_df['fingerprint'] = test_df['smiles'].apply(get_fingerprint)
 test_df = test_df.dropna(subset=['fingerprint'])
+print(f'Test samples after fingerprinting: {len(test_df)}')
 
 # Convert to numpy array
 X_test = np.array([list(fp) for fp in test_df['fingerprint']])
+
+# Apply the same scaling
+X_test = scaler.transform(X_test)
 
 class TestDataset(Dataset):
     def __init__(self, X):
@@ -198,13 +263,16 @@ class TestDataset(Dataset):
     def __getitem__(self, idx):
         return self.X[idx]
 
+# Create Test Dataset and DataLoader
 test_dataset = TestDataset(X_test)
-test_loader = DataLoader(test_dataset, batch_size=64)
+test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=2)
 
 # Load the best model
 model.load_state_dict(torch.load('best_model.pth'))
 model.eval()
+print("\nLoaded the best model for inference.")
 
+# Make predictions
 predictions = []
 with torch.no_grad():
     for X_batch in tqdm(test_loader, desc="Predicting"):
@@ -215,4 +283,6 @@ with torch.no_grad():
 
 # Save Predictions
 test_df['predicted_class'] = predictions
-test_df[['id', 'predicted_class']].to_csv('predictions.csv', index=False)
+output_df = test_df[['id', 'predicted_class']]
+output_df.to_csv('predictions.csv', index=False)
+print("\nPredictions saved to 'predictions.csv'")
