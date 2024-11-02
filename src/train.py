@@ -29,6 +29,7 @@ from src.tokenizer import GPT4Tokenizer
 tokenizer = GPT4Tokenizer()
 tokenizer.load_vocab('vocab.json')
 tokenizer.vocab[512] = '<none>'
+tokenizer.pad_idx = 512
 
 # Encode data
 encoded_data = []
