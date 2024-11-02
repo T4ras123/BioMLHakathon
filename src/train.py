@@ -84,11 +84,15 @@ def get_batches(dataset, batch_size):
         tokens, labels = batch
         yield tokens.to(device), labels.to(device)
 
-def train_model(model, train_dataset, val_dataset, epochs=10, batch_size=32, lr=1e-4):
+def train_model(model, train_dataset, val_dataset, epochs=10, batch_size=32, lr=1e-3):
     optimizer = optim.AdamW(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
+    
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    
+    best_val_accuracy = 0.0
     
     for epoch in range(epochs):
         model.train()
@@ -105,8 +109,12 @@ def train_model(model, train_dataset, val_dataset, epochs=10, batch_size=32, lr=
         avg_loss = total_loss / len(train_loader)
         val_accuracy = evaluate(model, val_loader)
         print(f'Epoch {epoch+1}, Loss: {avg_loss:.4f}, Validation Accuracy: {val_accuracy:.4f}')
-    
-    torch.save(model.state_dict(), 'classification_transformer.pth')
+        
+        if val_accuracy > best_val_accuracy:
+            best_val_accuracy = val_accuracy
+            torch.save(model.state_dict(), 'best_classification_transformer.pth')
+        
+        scheduler.step()
 
 def evaluate(model, loader):
     model.eval()
@@ -143,7 +151,15 @@ if __name__ == "__main__":
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
     
     # Initialize the model
-    model = ClassificationTransformer(vocab_size=vocab_size, max_len=64).to(device)
+    model = ClassificationTransformer(
+      vocab_size=vocab_size,
+      emb_dim=64,
+      num_heads=4,
+      num_layers=3,
+      max_len=64,
+      num_classes=2,
+      dropout=0.1
+    ).to(device)
     
     # Train the model
     train_model(model, train_dataset, val_dataset, epochs=10, batch_size=32, lr=1e-3)
