@@ -1,177 +1,216 @@
 import pandas as pd
+import numpy as np
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import accuracy_score, roc_auc_score
+from imblearn.over_sampling import SMOTE
 import torch
 from torch.utils.data import Dataset, DataLoader
-from transformers import BertTokenizer, BertModel, BertConfig
 import torch.nn as nn
-from sklearn.model_selection import train_test_split
+import torch.optim as optim
 from tqdm import tqdm
 
-# Custom Dataset
-class SMILESDataset(Dataset):
-    def __init__(self, smiles, labels, tokenizer, max_length=100):
-        self.smiles = smiles
-        self.labels = labels
-        self.tokenizer = tokenizer
-        self.max_length = max_length
+# ==============================
+# 1. Data Preprocessing
+# ==============================
+
+# Load training data
+train_df = pd.read_csv('train.csv')
+
+# Function to compute Morgan fingerprints
+def get_fingerprint(smiles, radius=2, n_bits=2048):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol:
+        return AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+    else:
+        return None
+
+# Convert SMILES to fingerprints
+train_df['fingerprint'] = train_df['smiles'].apply(get_fingerprint)
+train_df = train_df.dropna(subset=['fingerprint'])
+
+# Convert fingerprints to numpy arrays
+X = np.array([list(fp) for fp in train_df['fingerprint']])
+y = train_df['activity'].values
+
+# Handle class imbalance using SMOTE
+smote = SMOTE(random_state=42)
+X_res, y_res = smote.fit_resample(X, y)
+
+# Split data
+X_train, X_val, y_train, y_val = train_test_split(
+    X_res, y_res, test_size=0.2, random_state=42, stratify=y_res
+)
+
+# ==============================
+# 2. Dataset and DataLoader
+# ==============================
+
+class FingerprintDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.long)
     
     def __len__(self):
-        return len(self.smiles)
+        return len(self.X)
     
     def __getitem__(self, idx):
-        smile = self.smiles[idx]
-        label = self.labels[idx] if self.labels is not None else -1
-        encoding = self.tokenizer.encode_plus(
-            smile,
-            add_special_tokens=True,
-            max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            return_attention_mask=True,
-            return_tensors='pt',
-        )
-        return {
-            'input_ids': encoding['input_ids'].flatten(),
-            'attention_mask': encoding['attention_mask'].flatten(),
-            'labels': torch.tensor(label, dtype=torch.long) if label != -1 else torch.tensor(label, dtype=torch.long)
-        }
+        return self.X[idx], self.y[idx]
 
-# Transformer Classification Model
-class BertClassifier(nn.Module):
-    def __init__(self, n_classes):
-        super(BertClassifier, self).__init__()
-        self.bert = BertModel.from_pretrained('bert-base-uncased')
-        self.drop = nn.Dropout(p=0.3)
-        self.out = nn.Linear(self.bert.config.hidden_size, n_classes)
+train_dataset = FingerprintDataset(X_train, y_train)
+val_dataset = FingerprintDataset(X_val, y_val)
+
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=64)
+
+# ==============================
+# 3. Model Definition (GNN)
+# ==============================
+
+class SimpleNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.3):
+        super(SimpleNN, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
     
-    def forward(self, input_ids, attention_mask):
-        outputs = self.bert(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
-        pooled_output = outputs.pooler_output
-        output = self.drop(pooled_output)
-        return self.out(output)
+    def forward(self, x):
+        out = self.fc1(x)
+        out = self.relu(out)
+        out = self.dropout(out)
+        out = self.fc2(out)
+        return out
 
-# Parameters
-EPOCHS = 3
-BATCH_SIZE = 16
-MAX_LENGTH = 100
-LEARNING_RATE = 2e-5
+input_dim = X_train.shape[1]
+hidden_dim = 512
+output_dim = 2
 
-# Load Data
-train_df = pd.read_csv('train.csv')
-test_df = pd.read_csv('test.csv')
-
-# Split training data
-train_texts, val_texts, train_labels, val_labels = train_test_split(
-    train_df['smiles'], train_df['activity'], test_size=0.2, random_state=42
-)
-
-# Initialize Tokenizer
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-
-# Create Datasets
-train_dataset = SMILESDataset(
-    smiles=train_texts.to_numpy(),
-    labels=train_labels.to_numpy(),
-    tokenizer=tokenizer,
-    max_length=MAX_LENGTH
-)
-
-val_dataset = SMILESDataset(
-    smiles=val_texts.to_numpy(),
-    labels=val_labels.to_numpy(),
-    tokenizer=tokenizer,
-    max_length=MAX_LENGTH
-)
-
-# Create DataLoaders
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
-
-# Initialize Model
-model = BertClassifier(n_classes=2)
+model = SimpleNN(input_dim, hidden_dim, output_dim)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = model.to(device)
 
-# Define Optimizer and Loss
-optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-criterion = nn.CrossEntropyLoss()
+# ==============================
+# 4. Training Setup
+# ==============================
 
-# Training Function
-def train_epoch(model, data_loader, optimizer, criterion, device):
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+
+# ==============================
+# 5. Training and Evaluation Functions
+# ==============================
+
+def train_epoch(model, loader, criterion, optimizer, device):
     model.train()
-    losses = []
-    correct_predictions = 0
-    
-    for batch in tqdm(data_loader, desc="Training"):
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        labels = batch['labels'].to(device)
+    running_loss = 0.0
+    correct = 0
+    for X_batch, y_batch in tqdm(loader, desc="Training"):
+        X_batch = X_batch.to(device)
+        y_batch = y_batch.to(device)
         
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        _, preds = torch.max(outputs, dim=1)
-        loss = criterion(outputs, labels)
-        
-        correct_predictions += torch.sum(preds == labels)
-        losses.append(loss.item())
-        
+        optimizer.zero_grad()
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
         loss.backward()
         optimizer.step()
-        optimizer.zero_grad()
-    
-    return correct_predictions.double() / len(data_loader.dataset), sum(losses) / len(losses)
-
-# Evaluation Function
-def eval_model(model, data_loader, criterion, device):
-    model.eval()
-    losses = []
-    correct_predictions = 0
-    
-    with torch.no_grad():
-        for batch in tqdm(data_loader, desc="Evaluating"):
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
-            
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            _, preds = torch.max(outputs, dim=1)
-            loss = criterion(outputs, labels)
-            
-            correct_predictions += torch.sum(preds == labels)
-            losses.append(loss.item())
-    
-    return correct_predictions.double() / len(data_loader.dataset), sum(losses) / len(losses)
-
-# Training Loop
-for epoch in range(EPOCHS):
-    print(f'Epoch {epoch +1}/{EPOCHS}')
-    train_acc, train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
-    print(f'Train loss {train_loss} accuracy {train_acc}')
-    
-    val_acc, val_loss = eval_model(model, val_loader, criterion, device)
-    print(f'Validation loss {val_loss} accuracy {val_acc}')
-
-# Inference on Test Data
-test_dataset = SMILESDataset(
-    smiles=test_df['smiles'].to_numpy(),
-    labels=None,
-    tokenizer=tokenizer,
-    max_length=MAX_LENGTH
-)
-
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
-
-model.eval()
-predictions = []
-
-with torch.no_grad():
-    for batch in tqdm(test_loader, desc="Predicting"):
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
         
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        _, preds = torch.max(outputs, dim=1)
+        running_loss += loss.item() * X_batch.size(0)
+        _, preds = torch.max(outputs, 1)
+        correct += torch.sum(preds == y_batch)
+    
+    epoch_loss = running_loss / len(loader.dataset)
+    epoch_acc = correct.double() / len(loader.dataset)
+    return epoch_loss, epoch_acc.item()
+
+def eval_model(model, loader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    with torch.no_grad():
+        for X_batch, y_batch in tqdm(loader, desc="Evaluating"):
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.to(device)
+            
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            
+            running_loss += loss.item() * X_batch.size(0)
+            _, preds = torch.max(outputs, 1)
+            correct += torch.sum(preds == y_batch)
+    
+    epoch_loss = running_loss / len(loader.dataset)
+    epoch_acc = correct.double() / len(loader.dataset)
+    return epoch_loss, epoch_acc.item()
+
+# ==============================
+# 6. Training Loop with Early Stopping
+# ==============================
+
+best_val_acc = 0.0
+patience = 5
+counter = 0
+num_epochs = 50
+
+for epoch in range(num_epochs):
+    print(f'Epoch {epoch+1}/{num_epochs}')
+    train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
+    val_loss, val_acc = eval_model(model, val_loader, criterion, device)
+    
+    print(f'Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}')
+    print(f'Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}')
+    
+    scheduler.step()
+    
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        torch.save(model.state_dict(), 'best_model.pth')
+        counter = 0
+    else:
+        counter += 1
+        if counter >= patience:
+            print("Early stopping")
+            break
+
+# ==============================
+# 7. Inference on Test Data
+# ==============================
+
+# Load test data
+test_df = pd.read_csv('test.csv')
+
+# Convert SMILES to fingerprints
+test_df['fingerprint'] = test_df['smiles'].apply(get_fingerprint)
+test_df = test_df.dropna(subset=['fingerprint'])
+
+# Convert to numpy array
+X_test = np.array([list(fp) for fp in test_df['fingerprint']])
+
+class TestDataset(Dataset):
+    def __init__(self, X):
+        self.X = torch.tensor(X, dtype=torch.float32)
+    
+    def __len__(self):
+        return len(self.X)
+    
+    def __getitem__(self, idx):
+        return self.X[idx]
+
+test_dataset = TestDataset(X_test)
+test_loader = DataLoader(test_dataset, batch_size=64)
+
+# Load the best model
+model.load_state_dict(torch.load('best_model.pth'))
+model.eval()
+
+predictions = []
+with torch.no_grad():
+    for X_batch in tqdm(test_loader, desc="Predicting"):
+        X_batch = X_batch.to(device)
+        outputs = model(X_batch)
+        _, preds = torch.max(outputs, 1)
         predictions.extend(preds.cpu().numpy())
 
 # Save Predictions
