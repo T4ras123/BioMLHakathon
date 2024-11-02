@@ -38,7 +38,7 @@ for row in train_data:
 # pad all sequences to the same length
 padded_data = []
 for tokens, label in encoded_data:
-  padded_tokens = F.pad(tokens, (0, 64 - len(tokens)), value=0)
+  padded_tokens = F.pad(tokens, (0, 64 - len(tokens)), value=512)
   padded_data.append((padded_tokens, torch.tensor(label)))
 
 
