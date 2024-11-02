@@ -1,17 +1,20 @@
-import sys
+import json
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-import numpy as np
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from collections import Counter
+from sklearn.utils import class_weight
 import random
-import pandas as pd
 import matplotlib.pyplot as plt
+import numpy as np
 import csv
 import os
-from torch.utils.data import Dataset, DataLoader
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+import sys
 
+# Define the device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 with open('../Data/train.csv', 'r') as f:
     reader = csv.reader(f)
@@ -27,72 +30,125 @@ tokenizer = GPT4Tokenizer()
 tokenizer.load_vocab('vocab.json')
 tokenizer.vocab[512] = '<none>'
 
-
+# Encode data
 encoded_data = []
 for row in train_data:
     text = row[0]  # SMILES string
     label = int(row[1])  # Label
     tokens = tokenizer.encode(text)
-    encoded_data.append((torch.tensor(tokens), label))
-    
-# pad all sequences to the same length
+    encoded_data.append((tokens, label))
+
+# Pad all sequences to the same length (64) with padding value 0
 padded_data = []
 for tokens, label in encoded_data:
-  padded_tokens = F.pad(tokens, (0, 64 - len(tokens)), value=512)
-  padded_data.append((padded_tokens, torch.tensor(label)))
+    if len(tokens) < 64:
+        padded_tokens = F.pad(tokens, (0, 64 - len(tokens)), value=tokenizer.pad_idx)
+    else:
+        padded_tokens = tokens[:64]
+    padded_data.append((padded_tokens, torch.tensor(label, dtype=torch.long)))
 
+# Check label distribution
+labels = [label.item() for _, label in padded_data]
+label_counts = Counter(labels)
+print(f'Label Distribution: {label_counts}')
 
-class ClassificationTransformer(nn.Module):
-    def __init__(self, vocab_size, emb_dim=128, num_heads=8, num_layers=6, max_len=64, num_classes=2, dropout=0.1):
-        super(ClassificationTransformer, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=512)
-        self.pos_embedding = nn.Embedding(max_len, emb_dim)
-        
-        encoder_layers = nn.TransformerEncoderLayer(d_model=emb_dim, nhead=num_heads, dropout=dropout, batch_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
-        
-        self.cls_token = nn.Parameter(torch.randn(1, 1, emb_dim))
-        self.fc = nn.Linear(emb_dim, num_classes)
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, x):
-        batch_size, seq_length = x.size()
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        positions = torch.arange(seq_length, device=x.device).unsqueeze(0).expand(batch_size, -1)
-        x = self.embedding(x) + self.pos_embedding(positions)
-        x = torch.cat((cls_tokens, x), dim=1)
-        x = self.transformer(x)
-        cls_output = x[:, 0]
-        cls_output = self.dropout(cls_output)
-        logits = self.fc(cls_output)
-        return logits
+# If imbalanced, compute class weights
+if len(label_counts) > 1:
+    class_weights = class_weight.compute_class_weight(
+        class_weight='balanced',
+        classes=np.unique(labels),
+        y=labels
+    )
+    class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
+else:
+    class_weights = None
 
+# Define the Dataset
 class TokenDataset(Dataset):
-    def __init__(self, data, labels):
-        self.data = data  # List of token tensors
-        self.labels = labels  # List of labels
+    def __init__(self, data):
+        self.data = data  # List of (padded_tokens, label)
     
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
-        return self.data[idx], self.labels[idx]
+        return self.data[idx][0], self.data[idx][1]
 
-def get_batches(dataset, batch_size):
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    for batch in loader:
-        tokens, labels = batch
-        yield tokens.to(device), labels.to(device)
+# Split into training and validation sets
+train_size = int(0.8 * len(padded_data))
+val_size = len(padded_data) - train_size
+train_dataset, val_dataset = torch.utils.data.random_split(padded_data, [train_size, val_size])
 
-def train_model(model, train_dataset, val_dataset, epochs=1000, batch_size=32, lr=1e-4):
+# Define the Model
+class ClassificationTransformer(nn.Module):
+    def __init__(self, vocab_size, emb_dim=128, num_heads=8, num_layers=6, max_len=64, num_classes=2, dropout=0.1):
+        super(ClassificationTransformer, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=0)
+        self.pos_embedding = nn.Embedding(max_len, emb_dim)
+        
+        encoder_layers = nn.TransformerEncoderLayer(
+            d_model=emb_dim,
+            nhead=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
+        
+        self.cls_token = nn.Parameter(torch.randn(1, 1, emb_dim))
+        nn.init.xavier_uniform_(self.cls_token)
+        self.fc = nn.Linear(emb_dim, num_classes)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(emb_dim)
+    
+    def forward(self, x):
+        batch_size, seq_length = x.size()
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # (batch_size, 1, emb_dim)
+        positions = torch.arange(seq_length, device=x.device).unsqueeze(0).expand(batch_size, -1)  # (batch_size, seq_length)
+        x = self.embedding(x) + self.pos_embedding(positions)  # (batch_size, seq_length, emb_dim)
+        x = torch.cat((cls_tokens, x), dim=1)  # (batch_size, seq_length + 1, emb_dim)
+        x = self.transformer(x)  # (batch_size, seq_length + 1, emb_dim)
+        cls_output = x[:, 0]  # (batch_size, emb_dim)
+        cls_output = self.norm(cls_output)
+        cls_output = self.dropout(cls_output)
+        logits = self.fc(cls_output)  # (batch_size, num_classes)
+        return logits
+
+# Define the Evaluation Function
+def evaluate(model, loader):
+    model.eval()
+    correct = 0
+    total = 0
+    all_preds = []
+    all_labels = []
+    with torch.no_grad():
+        for tokens, labels in loader:
+            tokens, labels = tokens.to(device), labels.to(device)
+            outputs = model(tokens)
+            _, preds = torch.max(outputs, dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+    accuracy = correct / total
+    print(f'Validation Accuracy: {accuracy:.4f}')
+    return accuracy
+
+# Define the Training Function
+def train_model(model, train_dataset, val_dataset, epochs=1000, batch_size=32, lr=0.005, patience=10):
     optimizer = optim.AdamW(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
+    if class_weights is not None:
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+    else:
+        criterion = nn.CrossEntropyLoss()
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5, verbose=True)
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
     
     best_val_accuracy = 0.0
+    trigger_times = 0
+    train_losses = []
+    val_accuracies = []
     
     for epoch in range(epochs):
         model.train()
@@ -103,58 +159,82 @@ def train_model(model, train_dataset, val_dataset, epochs=1000, batch_size=32, l
             outputs = model(tokens)
             loss = criterion(outputs, labels)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             total_loss += loss.item()
         
         avg_loss = total_loss / len(train_loader)
+        train_losses.append(avg_loss)
+        
         val_accuracy = evaluate(model, val_loader)
+        val_accuracies.append(val_accuracy)
+        
+        scheduler.step(val_accuracy)
         print(f'Epoch {epoch+1}, Loss: {avg_loss:.4f}, Validation Accuracy: {val_accuracy:.4f}')
         
         if val_accuracy > best_val_accuracy:
             best_val_accuracy = val_accuracy
+            trigger_times = 0
             torch.save(model.state_dict(), 'best_classification_transformer.pth')
+            print(f'Best model saved with accuracy: {best_val_accuracy:.4f}')
+        else:
+            trigger_times += 1
+            if trigger_times >= patience:
+                print('Early stopping triggered')
+                break
         
-        scheduler.step()
+        # Optional: Plot training progress every 50 epochs
+        if (epoch + 1) % 50 == 0:
+            plt.figure(figsize=(12, 5))
+            plt.subplot(1, 2, 1)
+            plt.plot(train_losses, label='Training Loss')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.title('Training Loss over Epochs')
+            plt.legend()
 
-def evaluate(model, loader):
-    model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for tokens, labels in loader:
-            tokens, labels = tokens.to(device), labels.to(device)
-            outputs = model(tokens)
-            _, preds = torch.max(outputs, dim=1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
-    return correct / total
+            plt.subplot(1, 2, 2)
+            plt.plot(val_accuracies, label='Validation Accuracy')
+            plt.xlabel('Epoch')
+            plt.ylabel('Accuracy')
+            plt.title('Validation Accuracy over Epochs')
+            plt.legend()
 
-# Example usage
+            plt.show()
+
+# Example Usage
 if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    vocab_size = len(tokenizer.vocab)
-
-    tokens = [item[0] for item in padded_data]
-    labels = [item[1] for item in padded_data]
-    
-    # Create the dataset
-    dataset = TokenDataset(tokens, labels)
-    
-    # Split into training and validation sets
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    # Define vocabulary size
+    vocab_size = len(vocab)  # Ensure vocab is properly loaded and defined
     
     # Initialize the model
     model = ClassificationTransformer(
-      vocab_size=vocab_size,
-      emb_dim=64,
-      num_heads=4,
-      num_layers=3,
-      max_len=64,
-      num_classes=2,
-      dropout=0.1
+        vocab_size=vocab_size,
+        emb_dim=128,     # Increased embedding dimension
+        num_heads=8,     # Increased number of heads
+        num_layers=6,    # Increased number of layers
+        max_len=64,
+        num_classes=2,
+        dropout=0.1
     ).to(device)
     
-    train_model(model, train_dataset, val_dataset, epochs=1000, batch_size=16, lr=1e-3)
+    # Train the model
+    train_model(model, train_dataset, val_dataset, epochs=1000, batch_size=32, lr=1e-3, patience=10)
+    
+    # Plot final training progress
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses, label='Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training Loss over Epochs')
+    plt.legend()
+
+    plt.subplot(1, 2, 2)
+    plt.plot(val_accuracies, label='Validation Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.title('Validation Accuracy over Epochs')
+    plt.legend()
+
+    plt.show()
