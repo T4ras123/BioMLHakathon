@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from rdkit import Chem
 from rdkit.Chem import rdMolDescriptors
+from rdkit.Chem import AllChem
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import accuracy_score, roc_auc_score
 from imblearn.over_sampling import SMOTE
@@ -31,25 +32,35 @@ print(f'Using device: {device}')
 # Load training data
 train_df = pd.read_csv('train.csv')
 
-# Function to compute Morgan fingerprints using MorganGenerator
+# Function to compute Morgan fingerprints using AllChem.GetMorganFingerprintAsBitVect
 def get_fingerprint(smiles, radius=2, n_bits=2048):
     mol = Chem.MolFromSmiles(smiles)
     if mol:
-        # Initialize MorganGenerator
-        mg = rdMolDescriptors.MorganGenerator(radius=radius, nBits=n_bits)
-        fp = mg.GetFingerprint(mol)
-        return np.array(fp)
+        # Generate Morgan Fingerprint as Bit Vector
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=n_bits)
+        # Convert ExplicitBitVect to a NumPy array
+        arr = np.zeros((1,), dtype=np.int8)
+        DataStructs.ConvertToNumpyArray(fp, arr)
+        return arr
     else:
         return None
+
+# Alternative: Using a generator if you prefer incremental fingerprint generation
+# However, using GetMorganFingerprintAsBitVect is more straightforward for this use case
+
+# Import DataStructs for conversion
+from rdkit import DataStructs
 
 # Convert SMILES to fingerprints
 print("Generating fingerprints...")
 train_df['fingerprint'] = train_df['smiles'].apply(get_fingerprint)
+initial_count = len(train_df)
 train_df = train_df.dropna(subset=['fingerprint'])
-print(f'Training samples after fingerprinting: {len(train_df)}')
+final_count = len(train_df)
+print(f'Dropped {initial_count - final_count} samples due to invalid SMILES.')
 
 # Convert fingerprints to numpy arrays
-X = np.array([list(fp) for fp in train_df['fingerprint']])
+X = np.array([fp for fp in train_df['fingerprint']])
 y = train_df['activity'].values
 
 # Handle class imbalance using SMOTE
@@ -123,7 +134,7 @@ class EnhancedNN(nn.Module):
         return out
 
 # Define model parameters
-input_dim = X_train.shape[1]      # Number of fingerprint bits
+input_dim = X_train.shape[1]      # Number of fingerprint bits (e.g., 2048)
 hidden_dim1 = 512
 hidden_dim2 = 256
 output_dim = 2                    # Number of classes
@@ -241,16 +252,30 @@ for epoch in range(num_epochs):
 # Load test data
 test_df = pd.read_csv('test.csv')
 
-# Convert SMILES to fingerprints
+# Function to compute fingerprints for test data
+def get_fingerprint_test(smiles, radius=2, n_bits=2048):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol:
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=n_bits)
+        arr = np.zeros((1,), dtype=np.int8)
+        DataStructs.ConvertToNumpyArray(fp, arr)
+        return arr
+    else:
+        return None
+
+# Convert SMILES to fingerprints for test data
 print("\nGenerating fingerprints for test data...")
-test_df['fingerprint'] = test_df['smiles'].apply(get_fingerprint)
+test_df['fingerprint'] = test_df['smiles'].apply(get_fingerprint_test)
+initial_test_count = len(test_df)
 test_df = test_df.dropna(subset=['fingerprint'])
-print(f'Test samples after fingerprinting: {len(test_df)}')
+final_test_count = len(test_df)
+print(f'Dropped {initial_test_count - final_test_count} test samples due to invalid SMILES.')
 
 # Convert to numpy array
-X_test = np.array([list(fp) for fp in test_df['fingerprint']])
+X_test = np.array([fp for fp in test_df['fingerprint']])
 
 # Apply the same scaling
+print("Scaling test features...")
 X_test = scaler.transform(X_test)
 
 class TestDataset(Dataset):
@@ -268,7 +293,7 @@ test_dataset = TestDataset(X_test)
 test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=2)
 
 # Load the best model
-model.load_state_dict(torch.load('best_model.pth'))
+model.load_state_dict(torch.load('best_model.pth', map_location=device))
 model.eval()
 print("\nLoaded the best model for inference.")
 
