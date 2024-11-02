@@ -258,9 +258,7 @@ for epoch in range(num_epochs):
             break
     
     # Early exit if desired accuracy is achieved
-    if best_val_acc >= 0.7:
-        print(f"Desired validation accuracy of {best_val_acc:.4f} achieved. Stopping training.")
-        break
+
 
 # ==============================
 # 8. Prediction on Test Data
