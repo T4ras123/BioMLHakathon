@@ -118,8 +118,7 @@ for epoch in range(20):
             all_labels.extend(y_batch.cpu().numpy())
     acc = accuracy_score(all_labels, all_preds)
     print(f'Epoch {epoch+1}, Validation Accuracy: {acc:.4f}')
-    if acc > 0.7:
-        break
+
 
 # ==============================
 # 6. Prediction on Test Data
