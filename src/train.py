@@ -133,12 +133,8 @@ def evaluate(model, loader):
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Assume padded_data is a list of tuples: [(tokens1, label1), (tokens2, label2), ...]
-    # Example dummy data
-    vocab_size = 1000
-    padded_data = [ (torch.randint(1, vocab_size, (64,)), random.randint(0, 1)) for _ in range(1000) ]
-    
-    # Extract tokens and labels
+    vocab_size = len(tokenizer.vocab)
+
     tokens = [item[0] for item in padded_data]
     labels = [item[1] for item in padded_data]
     
