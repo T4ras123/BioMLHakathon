@@ -157,4 +157,4 @@ if __name__ == "__main__":
       dropout=0.1
     ).to(device)
     
-    train_model(model, train_dataset, val_dataset, epochs=1000, batch_size=32, lr=0.0005)
+    train_model(model, train_dataset, val_dataset, epochs=1000, batch_size=32, lr=0.005)
