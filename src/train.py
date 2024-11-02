@@ -46,7 +46,7 @@ for tokens, label in encoded_data:
         padded_tokens = F.pad(tokens, (0, 64 - len(tokens)), value=tokenizer.pad_idx)
     else:
         padded_tokens = tokens[:64]
-    padded_data.append((padded_tokens, torch.tensor(label, dtype=torch.long)))
+    padded_data.append((torch.tensor(padded_tokens), torch.tensor(label, dtype=torch.long)))
 
 # Check label distribution
 labels = [label.item() for _, label in padded_data]
