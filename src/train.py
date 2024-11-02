@@ -45,7 +45,7 @@ for tokens, label in encoded_data:
 class ClassificationTransformer(nn.Module):
     def __init__(self, vocab_size, emb_dim=128, num_heads=8, num_layers=6, max_len=64, num_classes=2, dropout=0.1):
         super(ClassificationTransformer, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=0)
+        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=512)
         self.pos_embedding = nn.Embedding(max_len, emb_dim)
         
         encoder_layers = nn.TransformerEncoderLayer(d_model=emb_dim, nhead=num_heads, dropout=dropout, batch_first=True)
@@ -58,11 +58,12 @@ class ClassificationTransformer(nn.Module):
     def forward(self, x):
         batch_size, seq_length = x.size()
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        positions = torch.arange(seq_length, device=device).unsqueeze(0)
+        positions = torch.arange(seq_length, device=x.device).unsqueeze(0).expand(batch_size, -1)
         x = self.embedding(x) + self.pos_embedding(positions)
         x = torch.cat((cls_tokens, x), dim=1)
         x = self.transformer(x)
-        cls_output = x[:,0]  # CLS token
+        cls_output = x[:, 0]
+        cls_output = self.norm(cls_output)
         cls_output = self.dropout(cls_output)
         logits = self.fc(cls_output)
         return logits
