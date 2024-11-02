@@ -38,8 +38,8 @@ for row in train_data:
 # pad all sequences to the same length
 padded_data = []
 for tokens, label in encoded_data:
-    padded_tokens = F.pad(tokens, (0, 64 - len(tokens)), value=512)
-    padded_data.append((padded_tokens, torch.tensor(label)))
+  padded_tokens = F.pad(tokens, (0, 64 - len(tokens)), value=0)
+  padded_data.append((padded_tokens, torch.tensor(label)))
 
 
 class ClassificationTransformer(nn.Module):
@@ -48,7 +48,7 @@ class ClassificationTransformer(nn.Module):
         self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=0)
         self.pos_embedding = nn.Embedding(max_len, emb_dim)
         
-        encoder_layers = nn.TransformerEncoderLayer(d_model=emb_dim, nhead=num_heads, dropout=dropout)
+        encoder_layers = nn.TransformerEncoderLayer(d_model=emb_dim, nhead=num_heads, dropout=dropout, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
         
         self.cls_token = nn.Parameter(torch.randn(1, 1, emb_dim))
@@ -61,9 +61,8 @@ class ClassificationTransformer(nn.Module):
         positions = torch.arange(seq_length, device=device).unsqueeze(0)
         x = self.embedding(x) + self.pos_embedding(positions)
         x = torch.cat((cls_tokens, x), dim=1)
-        x = x.permute(1, 0, 2)  # Transformer expects (seq_length, batch_size, emb_dim)
         x = self.transformer(x)
-        cls_output = x[0]  # CLS token
+        cls_output = x[:,0]  # CLS token
         cls_output = self.dropout(cls_output)
         logits = self.fc(cls_output)
         return logits
