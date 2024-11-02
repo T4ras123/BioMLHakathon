@@ -63,7 +63,6 @@ class ClassificationTransformer(nn.Module):
         x = torch.cat((cls_tokens, x), dim=1)
         x = self.transformer(x)
         cls_output = x[:, 0]
-        cls_output = self.norm(cls_output)
         cls_output = self.dropout(cls_output)
         logits = self.fc(cls_output)
         return logits
